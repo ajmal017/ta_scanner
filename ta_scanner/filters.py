@@ -20,57 +20,76 @@ class FilterException(Exception):
 
 
 class BaseFitler(metaclass=abc.ABCMeta):
-    def __init__(self):
-        pass
+    def __init__(
+        self, field_name: str, result_field_name: str, params: Dict[FilterOptions, Any]
+    ):
+        self.field_name = field_name
+        self.result_field_name = result_field_name
+        self.params = params
 
     def ensure_required_filter_options(
         self, expected: List[FilterOptions], actual: Dict[FilterOptions, Any]
     ):
         for fo_key in expected:
             if fo_key not in actual:
-                raise FilterException(f"expected this key key = {fo_key}")
+                raise FilterException(f"expected key = {fo_key}")
+
+    @abc.abstractmethod
+    def apply(self, df, field_name, filter_options):
+        pass
 
 
 class FilterCumsum(BaseFitler):
-    name = FilterNames.filter_cumsum.value
-
     required_filter_options = [
         FilterOptions.win_points,
         FilterOptions.loss_points,
         FilterOptions.threshold_intervals,
     ]
 
-    def apply(
-        self,
-        df: pd.DataFrame,
-        field_name: str,
-        filter_options: Dict[FilterOptions, Any],
-    ):
-        self.ensure_required_filter_options(
-            self.required_filter_options, filter_options
-        )
+    def log_exit(self, action: str, diff, row):
+        logger.debug(f"Action={action}. Ts={row.ts}. Diff={diff}. Close={row.close}")
 
-        query_signals = f"{field_name} != 0"
-        threshold = filter_options[FilterOptions.threshold_intervals]
+    def log_entry(self, action, row):
+        logger.debug(f"Action={action}. Ts={row.ts}. Close={row.close}")
 
-        for index, rs in df.query(query_signals).iterrows():
-            signal_direction = df.loc[index, field_name]
-            logger.debug(f"{signal_direction} @ {rs.close}")
+    def apply(self, df: pd.DataFrame, inverse: int = 1):
+        self.ensure_required_filter_options(self.required_filter_options, self.params)
+
+        query_signals = f"{self.field_name} != 0"
+        query_results = df.query(query_signals)
+
+        threshold = self.params[FilterOptions.threshold_intervals]
+
+        for index, rs in query_results.iterrows():
+            signal_direction = rs[self.field_name] * inverse
+            self.log_entry(signal_direction, rs)
 
             for index_after in range(0, threshold):
-                df_index = index + index_after
+                # df_index = index + index_after
+                df_index = df.index.get_loc(index) + index_after
+
+                if df_index >= len(df.index):
+                    rx = df.iloc[df_index - 1]
+                    diff = (rx.close - rs.close) * signal_direction
+                    self.log_exit("MaxTime", diff, rx)
+                    rxi = rx.name
+                    df.loc[rxi, self.result_field_name] = diff
+                    break
+
                 rx = df.iloc[df_index]
+                rxi = rx.name
                 diff = (rx.close - rs.close) * signal_direction
 
-                if diff >= filter_options[FilterOptions.win_points]:
-                    df.loc[df_index, self.name] = diff
-                    logger.debug(f"Won @ {rx.close}. Diff = {diff}")
+                if diff >= self.params[FilterOptions.win_points]:
+                    self.log_exit("Won", diff, df.iloc[df_index])
+                    df.loc[rxi, self.result_field_name] = diff
                     break
-                if diff <= (filter_options[FilterOptions.loss_points] * -1.0):
-                    df.loc[df_index, self.name] = diff
-                    logger.debug(f"Loss @ {rx.close}. Diff = {diff}")
+
+                if diff <= (self.params[FilterOptions.loss_points] * -1.0):
+                    self.log_exit("Lost", diff, df.iloc[df_index])
+                    df.loc[rxi, self.result_field_name] = diff
                     break
 
                 if index_after == threshold - 1:
-                    logger.debug(f"Max time. Diff = {diff}")
-                    df.loc[df_index, self.name] = diff
+                    self.log_exit("MaxTime", diff, df.iloc[df_index])
+                    df.loc[rxi, self.result_field_name] = diff
